@@ -157,6 +157,8 @@ trait ZRef[+EA, +EB, -A, +B] extends Serializable { self =>
    */
   def updateSomeAndGet[E](pf: PartialFunction[B, A])(implicit ev1: EA <:< E, ev2: EB <:< E): IO[E, B]
 
+  def mapEither[EC >: EB, C](f: B => Either[EC, C]): ZRef[EA, EC, A, C]
+
 }
 object ZRef extends Serializable {
   final case class Atomic[A](value: AtomicReference[A]) extends ZRef[Nothing, Nothing, A, A] {
@@ -301,6 +303,77 @@ object ZRef extends Serializable {
 
         next
       }
+
+    def mapEither[E, B](f: A => Either[E, B]): ZRef[Nothing, E, A, B] =
+      new Derived[Nothing, E, A, B] {
+        protected type S = A
+        protected val original                         = self
+        protected def getter(s: S): Either[E, B]       = f(s)
+        protected def setter(a: A): Either[Nothing, S] = Right(a)
+        def setAsync(a: A): UIO[Unit]                  = ZIO.fromEither(setter(a)).map(a0 => original.setAsync(a0)).unit
+        def updateSome[E2](pf: PartialFunction[B, A])(implicit ev1: Nothing <:< E2, ev2: E <:< E2): IO[E2, Unit] = {
+          val f: B => A = b => pf.lift(b).getOrElse(original.value.get())
+          update(f)(ev1, ev2)
+        }
+        def modifySome[E2, C](c: C)(
+          pf: PartialFunction[B, (C, A)]
+        )(implicit ev1: Nothing <:< E2, ev2: E <:< E2): IO[E2, C] = {
+          val f: B => (C, A) = b => pf.lift(b).getOrElse((c, original.value.get()))
+          modify(f)(ev1, ev2)
+        }
+
+      }
+    sealed trait Derived[+EA, +EB, -A, +B] extends ZRef[EA, EB, A, B] { self =>
+      protected type S
+      protected val original: Atomic[S]
+      protected def getter(s: S): Either[EB, B]
+      protected def setter(a: A): Either[EA, S]
+      final def get: IO[EB, B] =
+        original.get.map(getter).absolve
+      final def getAndSet(a: A): IO[EA, B]                                                                = ???
+      def getAndUpdate[E](f: B => A)(implicit ev1: EA <:< E, ev2: EB <:< E): IO[E, B]                     = ???
+      def getAndUpdateSome[E](pf: PartialFunction[B, A])(implicit ev1: EA <:< E, ev2: EB <:< E): IO[E, B] = ???
+      def updateSomeAndGet[E](pf: PartialFunction[B, A])(implicit ev1: EA <:< E, ev2: EB <:< E): IO[E, B] = ???
+      final def set(a: A): IO[EA, Unit] =
+        IO.fromEither(setter(a)).flatMap(original.set)
+      final def modify[E, C](f: B => (C, A))(implicit ev1: EA <:< E, ev2: EB <:< E): IO[E, C] =
+        original
+          .modify[E, Either[E, C]] { s =>
+            getter(s) match {
+              case Left(eb) => (Left(ev2(eb)), s)
+              case Right(b) =>
+                val (c, a) = f(b)
+                setter(a) match {
+                  case Left(ea)  => (Left(ev1(ea)), s)
+                  case Right(s1) => (Right(c), s1)
+                }
+            }
+          }(ev1, ev2)
+          .absolve
+
+      final def mapEither[EC >: EB, C](f: B => Either[EC, C]): ZRef[EA, EC, A, C] =
+        new Derived[EA, EC, A, C] {
+
+          protected type S = self.S
+          protected val original                    = self.original
+          protected def getter(s: S): Either[EC, C] = self.getter(s).flatMap(f)
+          protected def setter(a: A): Either[EA, S] = self.setter(a)
+          def setAsync(a: A): zio.IO[EA, Unit]      = ZIO.fromEither(setter(a)).map(a0 => original.setAsync(a0)).unit
+          override def updateSome[E](pf: PartialFunction[C, A])(implicit ev1: EA <:< E, ev2: EC <:< E): IO[E, Unit] = {
+            val f: C => A = c => pf.lift(c).getOrElse(???)
+            update(f)
+
+          }
+          def modifySome[E, C2](c2: C2)(
+            pf: PartialFunction[C, (C2, A)]
+          )(implicit ev1: EA <:< E, ev2: EC <:< E): IO[E, C2] = {
+            val f: C => (C2, A) = c => pf.lift(c).getOrElse((c2, ???))
+            modify(f)
+          }
+
+        }
+
+    }
 
   }
 
